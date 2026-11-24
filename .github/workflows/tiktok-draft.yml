@@ -1,0 +1,75 @@
+name: TikTok draft (one video)
+
+# Lab of Tory (Claude, 2026-11-20): sends ONE video, given by URL, to the connected TikTok account's drafts (inbox).
+# Draft only: Venloud finishes and posts it in the TikTok app. Never posts publicly.
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Direct MP4 URL (e.g. a GitHub release asset)"
+        required: true
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -q requests
+      - name: Download video
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: curl -fsSL -o draft.mp4 "$VIDEO_URL" && ls -la draft.mp4
+      - name: Send to TikTok drafts
+        env:
+          TIKTOK_CLIENT_KEY: ${{ secrets.TIKTOK_CLIENT_KEY }}
+          TIKTOK_CLIENT_SECRET: ${{ secrets.TIKTOK_CLIENT_SECRET }}
+          TIKTOK_REFRESH_TOKEN: ${{ secrets.TIKTOK_REFRESH_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, requests
+          from pathlib import Path
+          r = requests.post("https://open.tiktokapis.com/v2/oauth/token/", timeout=30,
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            data={"client_key": os.environ["TIKTOK_CLIENT_KEY"], "client_secret": os.environ["TIKTOK_CLIENT_SECRET"],
+                                  "grant_type": "refresh_token", "refresh_token": os.environ["TIKTOK_REFRESH_TOKEN"]})
+          d = r.json()
+          if "access_token" not in d:
+              raise SystemExit(f"Token refresh failed: {d.get('error')} {d.get('error_description')}")
+          if d.get("refresh_token") and d["refresh_token"] != os.environ["TIKTOK_REFRESH_TOKEN"]:
+              Path(".new_refresh_token").write_text(d["refresh_token"])
+          tok = d["access_token"]
+          p = Path("draft.mp4"); size = p.stat().st_size
+          i = requests.post("https://open.tiktokapis.com/v2/post/publish/inbox/video/init/", timeout=30,
+                            headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"},
+                            json={"source_info": {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": size, "total_chunk_count": 1}}).json()
+          if i.get("error", {}).get("code", "ok") != "ok":
+              raise SystemExit(f"Init failed: {i['error']}")
+          with p.open("rb") as f:
+              u = requests.put(i["data"]["upload_url"], data=f, timeout=300,
+                               headers={"Content-Type": "video/mp4", "Content-Range": f"bytes 0-{size-1}/{size}"})
+          if u.status_code not in (200, 201, 206):
+              raise SystemExit(f"Upload failed: HTTP {u.status_code}")
+          pid = i["data"]["publish_id"]
+          import time
+          for _ in range(20):
+              s = requests.post("https://open.tiktokapis.com/v2/post/publish/status/fetch/", timeout=30,
+                                headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"},
+                                json={"publish_id": pid}).json()
+              st = s.get("data", {}).get("status")
+              print("status:", st)
+              if st in ("SEND_TO_USER_INBOX", "PUBLISH_COMPLETE", "FAILED"):
+                  break
+              time.sleep(6)
+          if st == "FAILED":
+              raise SystemExit(f"TikTok failed it: {s.get('data', {}).get('fail_reason')}")
+          print("Sent to TikTok drafts:", st)
+          PY
+      - name: Save rotated refresh token
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -s .new_refresh_token ]; then gh secret set TIKTOK_REFRESH_TOKEN --repo "${{ github.repository }}" < .new_refresh_token; rm -f .new_refresh_token; echo "refresh token rotated and saved"; fi
